@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import asyncio
 from datetime import datetime, timezone
 
 import discord
@@ -44,10 +43,7 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     notification_channel_id INTEGER,
     dm_enabled INTEGER NOT NULL DEFAULT 0,
     afk_channel_id INTEGER,
-    notification_message TEXT NOT NULL DEFAULT
-    '🎉 حصلت على **{added} نقطة**!\n'
-    '🎙️ وقتك المحتسب: **{time}**\n'
-    '🪙 رصيدك الحالي: **{points} نقطة**'
+    notification_message TEXT NOT NULL DEFAULT '🎉 حصلت على **{added} نقطة**! - 🎙️ وقتك المحتسب: **{time}** - 🪙 رصيدك الحالي: **{points} نقطة**'
 )
 """)
 
@@ -73,41 +69,66 @@ db.commit()
 # =========================================================
 
 def ensure_user(guild_id: int, user_id: int):
-    db.execute("""
-        INSERT OR IGNORE INTO users (guild_id, user_id)
-        VALUES (?, ?)
-    """, (guild_id, user_id))
+    db.execute(
+        """
+        INSERT OR IGNORE INTO users
+        (guild_id, user_id, points, voice_seconds)
+        VALUES (?, ?, 0, 0)
+        """,
+        (guild_id, user_id)
+    )
     db.commit()
 
 
 def get_user(guild_id: int, user_id: int):
     ensure_user(guild_id, user_id)
-    return db.execute("""
-        SELECT * FROM users
-        WHERE guild_id = ? AND user_id = ?
-    """, (guild_id, user_id)).fetchone()
+
+    return db.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE guild_id = ?
+        AND user_id = ?
+        """,
+        (guild_id, user_id)
+    ).fetchone()
 
 
-def update_user(guild_id, user_id, points=None, voice_seconds=None):
+def update_user(
+    guild_id: int,
+    user_id: int,
+    points=None,
+    voice_seconds=None
+):
     current = get_user(guild_id, user_id)
 
-    new_points = current["points"] if points is None else points
+    new_points = (
+        current["points"]
+        if points is None
+        else points
+    )
+
     new_seconds = (
         current["voice_seconds"]
         if voice_seconds is None
         else voice_seconds
     )
 
-    db.execute("""
+    db.execute(
+        """
         UPDATE users
-        SET points = ?, voice_seconds = ?
-        WHERE guild_id = ? AND user_id = ?
-    """, (
-        new_points,
-        new_seconds,
-        guild_id,
-        user_id
-    ))
+        SET points = ?,
+            voice_seconds = ?
+        WHERE guild_id = ?
+        AND user_id = ?
+        """,
+        (
+            new_points,
+            new_seconds,
+            guild_id,
+            user_id
+        )
+    )
 
     db.commit()
 
@@ -121,7 +142,8 @@ def add_history(
     new_points,
     reason
 ):
-    db.execute("""
+    db.execute(
+        """
         INSERT INTO history (
             guild_id,
             user_id,
@@ -133,42 +155,64 @@ def add_history(
             created_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        guild_id,
-        user_id,
-        action,
-        amount,
-        old_points,
-        new_points,
-        reason,
-        datetime.now(timezone.utc).isoformat()
-    ))
+        """,
+        (
+            guild_id,
+            user_id,
+            action,
+            amount,
+            old_points,
+            new_points,
+            reason,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
 
     db.commit()
 
 
-def get_settings(guild_id):
-    row = db.execute("""
-        SELECT * FROM guild_settings
+def get_settings(guild_id: int):
+    row = db.execute(
+        """
+        SELECT *
+        FROM guild_settings
         WHERE guild_id = ?
-    """, (guild_id,)).fetchone()
+        """,
+        (guild_id,)
+    ).fetchone()
 
-    if not row:
-        db.execute("""
-            INSERT INTO guild_settings (guild_id)
+    if row is None:
+
+        db.execute(
+            """
+            INSERT INTO guild_settings (
+                guild_id
+            )
             VALUES (?)
-        """, (guild_id,))
+            """,
+            (guild_id,)
+        )
+
         db.commit()
 
-        row = db.execute("""
-            SELECT * FROM guild_settings
+        row = db.execute(
+            """
+            SELECT *
+            FROM guild_settings
             WHERE guild_id = ?
-        """, (guild_id,)).fetchone()
+            """,
+            (guild_id,)
+        ).fetchone()
 
     return row
 
 
+# =========================================================
+# TIME FORMAT
+# =========================================================
+
 def format_time(seconds: int):
+
     seconds = int(seconds)
 
     days = seconds // 86400
@@ -194,7 +238,10 @@ def format_time(seconds: int):
     if seconds and not parts:
         parts.append(f"{seconds} ثانية")
 
-    return " و".join(parts) if parts else "0 دقيقة"
+    if not parts:
+        return "0 دقيقة"
+
+    return " و".join(parts)
 
 
 # =========================================================
@@ -202,10 +249,11 @@ def format_time(seconds: int):
 # =========================================================
 
 intents = discord.Intents.default()
+
+intents.guilds = True
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
-intents.guilds = True
 intents.reactions = True
 
 bot = commands.Bot(
@@ -215,48 +263,59 @@ bot = commands.Bot(
 
 
 # =========================================================
-# VOICE TRACKING
+# VOICE SESSIONS
 # =========================================================
-
-# {
-#   (guild_id, user_id): {
-#       "last_tick": datetime,
-#       "last_activity": datetime
-#   }
-# }
 
 voice_sessions = {}
 
 
-def now():
+def current_time():
     return datetime.now(timezone.utc)
 
 
 def is_in_afk(member: discord.Member):
-    settings = get_settings(member.guild.id)
 
-    afk_id = settings["afk_channel_id"]
+    settings = get_settings(
+        member.guild.id
+    )
 
-    if not afk_id:
+    afk_channel_id = settings[
+        "afk_channel_id"
+    ]
+
+    if not afk_channel_id:
         return False
 
-    if not member.voice or not member.voice.channel:
+    if not member.voice:
         return False
 
-    return member.voice.channel.id == afk_id
+    if not member.voice.channel:
+        return False
+
+    return (
+        member.voice.channel.id
+        == afk_channel_id
+    )
 
 
-def is_user_active(guild_id, user_id):
-    session = voice_sessions.get((guild_id, user_id))
+def is_active(guild_id, user_id):
+
+    session = voice_sessions.get(
+        (guild_id, user_id)
+    )
 
     if not session:
         return False
 
-    inactive_for = (
-        now() - session["last_activity"]
+    inactive_seconds = (
+        current_time()
+        - session["last_activity"]
     ).total_seconds()
 
-    return inactive_for < INACTIVITY_MINUTES * 60
+    return (
+        inactive_seconds
+        < INACTIVITY_MINUTES * 60
+    )
 
 
 # =========================================================
@@ -264,20 +323,31 @@ def is_user_active(guild_id, user_id):
 # =========================================================
 
 def register_activity(member: discord.Member):
-    if not member.guild:
-        return
 
     if member.bot:
         return
 
-    if not member.voice or not member.voice.channel:
+    if not member.voice:
         return
 
-    key = (member.guild.id, member.id)
+    if not member.voice.channel:
+        return
+
+    key = (
+        member.guild.id,
+        member.id
+    )
 
     if key in voice_sessions:
-        voice_sessions[key]["last_activity"] = now()
 
+        voice_sessions[key][
+            "last_activity"
+        ] = current_time()
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
 
 async def send_point_notification(
     guild: discord.Guild,
@@ -287,89 +357,118 @@ async def send_point_notification(
     total_seconds: int
 ):
 
-    settings = get_settings(guild.id)
-
-    message = settings["notification_message"]
-
-    message = message.replace(
-        "{user}",
-        member.mention
+    settings = get_settings(
+        guild.id
     )
 
-    message = message.replace(
-        "{points}",
-        str(total_points)
-    )
+    message = settings[
+        "notification_message"
+    ]
 
-    message = message.replace(
-        "{added}",
-        str(added)
-    )
+    replacements = {
+        "{user}": member.mention,
+        "{points}": str(total_points),
+        "{added}": str(added),
+        "{time}": format_time(total_seconds),
+        "{total_time}": format_time(total_seconds)
+    }
 
-    message = message.replace(
-        "{time}",
-        format_time(total_seconds)
-    )
+    for key, value in replacements.items():
+        message = message.replace(
+            key,
+            value
+        )
 
-    message = message.replace(
-        "{total_time}",
-        format_time(total_seconds)
-    )
+    # -----------------------------------------
+    # CHANNEL
+    # -----------------------------------------
 
-    # Channel notification
-    channel_id = settings["notification_channel_id"]
+    channel_id = settings[
+        "notification_channel_id"
+    ]
 
     if channel_id:
-        channel = guild.get_channel(channel_id)
+
+        channel = guild.get_channel(
+            channel_id
+        )
 
         if channel:
+
             try:
-                await channel.send(message)
-            except Exception as e:
-                print(
-                    f"[Notification Error] {e}"
+                await channel.send(
+                    message
                 )
 
-    # DM notification
+            except Exception as error:
+                print(
+                    f"[CHANNEL ERROR] {error}"
+                )
+
+    # -----------------------------------------
+    # DM
+    # -----------------------------------------
+
     if settings["dm_enabled"]:
+
         try:
-            await member.send(message)
-        except Exception as e:
+            await member.send(
+                message
+            )
+
+        except Exception as error:
             print(
-                f"[DM Error] {member} -> {e}"
+                f"[DM ERROR] {member}: {error}"
             )
 
 
 # =========================================================
-# POINT CALCULATOR
+# PROCESS VOICE
 # =========================================================
 
 async def process_voice_member(
     guild: discord.Guild,
     member: discord.Member,
-    current_time: datetime
+    now_time: datetime
 ):
 
     if member.bot:
         return
 
-    if not member.voice or not member.voice.channel:
+    if not member.voice:
         return
+
+    if not member.voice.channel:
+        return
+
+    key = (
+        guild.id,
+        member.id
+    )
+
+    # -----------------------------------------
+    # AFK
+    # -----------------------------------------
 
     if is_in_afk(member):
-        key = (guild.id, member.id)
 
         if key in voice_sessions:
-            voice_sessions[key]["last_tick"] = current_time
+
+            voice_sessions[key][
+                "last_tick"
+            ] = now_time
 
         return
 
-    key = (guild.id, member.id)
+    # -----------------------------------------
+    # NEW SESSION
+    # -----------------------------------------
 
     if key not in voice_sessions:
+
         voice_sessions[key] = {
-            "last_tick": current_time,
-            "last_activity": current_time
+            "last_tick": now_time,
+            "last_activity": now_time
         }
 
         return
@@ -377,42 +476,69 @@ async def process_voice_member(
     session = voice_sessions[key]
 
     elapsed = (
-        current_time - session["last_tick"]
+        now_time
+        - session["last_tick"]
     ).total_seconds()
 
-    session["last_tick"] = current_time
-
-    # ---------------------------------------------
-    # 15 MINUTES WITHOUT ACTIVITY
-    # ---------------------------------------------
-
-    if not is_user_active(guild.id, member.id):
-
-        # Reset tick so downtime doesn't get counted
-        session["last_tick"] = current_time
-
-        return
+    session["last_tick"] = now_time
 
     if elapsed <= 0:
         return
+
+    # -----------------------------------------
+    # INACTIVITY
+    # -----------------------------------------
+
+    if not is_active(
+        guild.id,
+        member.id
+    ):
+
+        session[
+            "last_tick"
+        ] = now_time
+
+        return
+
+    # -----------------------------------------
+    # SAVE TIME
+    # -----------------------------------------
 
     user = get_user(
         guild.id,
         member.id
     )
 
-    old_seconds = user["voice_seconds"]
+    old_seconds = user[
+        "voice_seconds"
+    ]
 
-    new_seconds = old_seconds + int(elapsed)
+    new_seconds = (
+        old_seconds
+        + int(elapsed)
+    )
 
-    old_points = user["points"]
+    old_points = user[
+        "points"
+    ]
 
-    old_hours = old_seconds // 3600
-    new_hours = new_seconds // 3600
+    old_hours = (
+        old_seconds // 3600
+    )
 
-    gained_hours = new_hours - old_hours
+    new_hours = (
+        new_seconds // 3600
+    )
 
-    gained_points = gained_hours * POINTS_PER_HOUR
+    gained_hours = (
+        new_hours
+        - old_hours
+    )
+
+    gained_points = (
+        gained_hours
+        * POINTS_PER_HOUR
+    )
 
     update_user(
         guild.id,
@@ -421,7 +547,16 @@ async def process_voice_member(
         voice_seconds=new_seconds
     )
 
+    # -----------------------------------------
+    # POINTS REWARD
+    # -----------------------------------------
+
     if gained_points > 0:
+
+        new_points = (
+            old_points
+            + gained_points
+        )
 
         add_history(
             guild.id,
@@ -429,7 +564,7 @@ async def process_voice_member(
             "voice",
             gained_points,
             old_points,
-            old_points + gained_points,
+            new_points,
             "Voice activity"
         )
 
@@ -437,7 +572,7 @@ async def process_voice_member(
             guild,
             member,
             gained_points,
-            old_points + gained_points,
+            new_points,
             new_seconds
         )
 
@@ -449,7 +584,7 @@ async def process_voice_member(
 @tasks.loop(seconds=TICK_SECONDS)
 async def points_loop():
 
-    current_time = now()
+    now_time = current_time()
 
     for guild in bot.guilds:
 
@@ -462,26 +597,30 @@ async def points_loop():
                 continue
 
             try:
+
                 await process_voice_member(
                     guild,
                     member,
-                    current_time
+                    now_time
                 )
 
-            except Exception as e:
+            except Exception as error:
+
                 print(
-                    f"[Points Loop Error] "
-                    f"{guild.id} / {member.id}: {e}"
+                    f"[POINT LOOP ERROR] "
+                    f"{guild.id}/{member.id}: "
+                    f"{error}"
                 )
 
 
 @points_loop.before_loop
 async def before_points_loop():
+
     await bot.wait_until_ready()
 
 
 # =========================================================
-# VOICE EVENTS
+# VOICE EVENT
 # =========================================================
 
 @bot.event
@@ -499,20 +638,32 @@ async def on_voice_state_update(
         member.id
     )
 
-    current_time = now()
+    now_time = current_time()
 
-    # Joined voice
-    if before.channel is None and after.channel is not None:
+    # -----------------------------------------
+    # JOIN
+    # -----------------------------------------
+
+    if (
+        before.channel is None
+        and after.channel is not None
+    ):
 
         voice_sessions[key] = {
-            "last_tick": current_time,
-            "last_activity": current_time
+            "last_tick": now_time,
+            "last_activity": now_time
         }
 
         return
 
-    # Left voice
-    if before.channel is not None and after.channel is None:
+    # -----------------------------------------
+    # LEAVE
+    # -----------------------------------------
+
+    if (
+        before.channel is not None
+        and after.channel is None
+    ):
 
         voice_sessions.pop(
             key,
@@ -521,19 +672,21 @@ async def on_voice_state_update(
 
         return
 
-    # Moved voice channel
+    # -----------------------------------------
+    # MOVE
+    # -----------------------------------------
+
     if (
         before.channel is not None
         and after.channel is not None
-        and before.channel.id != after.channel.id
+        and before.channel.id
+        != after.channel.id
     ):
 
         voice_sessions[key] = {
-            "last_tick": current_time,
-            "last_activity": current_time
+            "last_tick": now_time,
+            "last_activity": now_time
         }
-
-        return
 
 
 # =========================================================
@@ -546,12 +699,18 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    member = message.author
+    if isinstance(
+        message.author,
+        discord.Member
+    ):
 
-    if isinstance(member, discord.Member):
-        register_activity(member)
+        register_activity(
+            message.author
+        )
 
-    await bot.process_commands(message)
+    await bot.process_commands(
+        message
+    )
 
 
 # =========================================================
@@ -559,7 +718,12 @@ async def on_message(message):
 # =========================================================
 
 @bot.event
-async def on_raw_reaction_add(payload):
+async def on_raw_reaction_add(
+    payload
+):
+
+    if payload.guild_id is None:
+        return
 
     guild = bot.get_guild(
         payload.guild_id
@@ -572,23 +736,30 @@ async def on_raw_reaction_add(payload):
         payload.user_id
     )
 
-    if not member or member.bot:
+    if not member:
         return
 
-    register_activity(member)
+    if member.bot:
+        return
+
+    register_activity(
+        member
+    )
 
 
 # =========================================================
-# BASIC COMMANDS
+# /points
 # =========================================================
 
 @bot.tree.command(
     name="points",
     description="عرض نقاطك ووقت الفويس"
 )
-async def points(interaction: discord.Interaction):
+async def points(
+    interaction: discord.Interaction
+):
 
-    user = get_user(
+    data = get_user(
         interaction.guild.id,
         interaction.user.id
     )
@@ -599,15 +770,15 @@ async def points(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="النقاط",
-        value=f"**{user['points']}**",
+        name="🪙 النقاط",
+        value=f"**{data['points']}**",
         inline=True
     )
 
     embed.add_field(
-        name="وقت الفويس",
+        name="🎙️ وقت الفويس",
         value=format_time(
-            user["voice_seconds"]
+            data["voice_seconds"]
         ),
         inline=True
     )
@@ -618,23 +789,31 @@ async def points(interaction: discord.Interaction):
     )
 
 
+# =========================================================
+# /points-top
+# =========================================================
+
 @bot.tree.command(
     name="points-top",
     description="عرض أعلى الأعضاء بالنقاط"
 )
-async def points_top(interaction):
+async def points_top(
+    interaction: discord.Interaction
+):
 
-    rows = db.execute("""
+    rows = db.execute(
+        """
         SELECT user_id, points, voice_seconds
         FROM users
         WHERE guild_id = ?
         ORDER BY points DESC
         LIMIT 10
-    """, (
-        interaction.guild.id,
-    )).fetchall()
+        """,
+        (interaction.guild.id,)
+    ).fetchall()
 
     if not rows:
+
         return await interaction.response.send_message(
             "❌ لا توجد بيانات بعد.",
             ephemeral=True
@@ -648,16 +827,20 @@ async def points_top(interaction):
         "🥉"
     ]
 
-    for index, row in enumerate(rows, start=1):
+    for index, row in enumerate(
+        rows,
+        start=1
+    ):
 
         member = interaction.guild.get_member(
             row["user_id"]
         )
 
-        if not member:
-            name = f"User {row['user_id']}"
-        else:
-            name = member.display_name
+        name = (
+            member.display_name
+            if member
+            else f"User {row['user_id']}"
+        )
 
         medal = (
             medals[index - 1]
@@ -680,6 +863,10 @@ async def points_top(interaction):
         embed=embed
     )
 
+
+# =========================================================
+# /points-user
+# =========================================================
 
 @bot.tree.command(
     name="points-user",
@@ -704,15 +891,17 @@ async def points_user(
     )
 
     embed.add_field(
-        name="النقاط",
-        value=str(data["points"])
+        name="🪙 النقاط",
+        value=str(data["points"]),
+        inline=True
     )
 
     embed.add_field(
-        name="وقت الفويس",
+        name="🎙️ وقت الفويس",
         value=format_time(
             data["voice_seconds"]
-        )
+        ),
+        inline=True
     )
 
     await interaction.response.send_message(
@@ -721,16 +910,25 @@ async def points_user(
 
 
 # =========================================================
-# ADMIN: GIVE
+# ADMIN CHECK
+# =========================================================
+
+def admin_only():
+
+    return app_commands.checks.has_permissions(
+        administrator=True
+    )
+
+
+# =========================================================
+# /points-give
 # =========================================================
 
 @bot.tree.command(
     name="points-give",
     description="إعطاء نقاط لعضو"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     user="العضو",
     amount="عدد النقاط",
@@ -768,23 +966,22 @@ async def points_give(
     )
 
     await interaction.response.send_message(
-        f"✅ تم إعطاء {user.mention} **{amount} نقطة**.\n"
+        f"✅ تم إعطاء {user.mention} "
+        f"**{amount} نقطة**.\n"
         f"🪙 رصيده الآن: **{new}**\n"
         f"📝 السبب: {reason}"
     )
 
 
 # =========================================================
-# ADMIN: REMOVE
+# /points-remove
 # =========================================================
 
 @bot.tree.command(
     name="points-remove",
     description="خصم نقاط من عضو"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     user="العضو",
     amount="عدد النقاط",
@@ -803,9 +1000,13 @@ async def points_remove(
     )
 
     old = data["points"]
-    new = max(0, old - amount)
 
-    actual_removed = old - new
+    new = max(
+        0,
+        old - amount
+    )
+
+    removed = old - new
 
     update_user(
         interaction.guild.id,
@@ -817,30 +1018,29 @@ async def points_remove(
         interaction.guild.id,
         user.id,
         "remove",
-        actual_removed,
+        removed,
         old,
         new,
         reason
     )
 
     await interaction.response.send_message(
-        f"✅ تم خصم **{actual_removed} نقطة** من {user.mention}.\n"
+        f"✅ تم خصم **{removed} نقطة** "
+        f"من {user.mention}.\n"
         f"🪙 رصيده الآن: **{new}**\n"
         f"📝 السبب: {reason}"
     )
 
 
 # =========================================================
-# ADMIN: SET
+# /points-set
 # =========================================================
 
 @bot.tree.command(
     name="points-set",
     description="تحديد نقاط عضو"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     user="العضو",
     amount="النقاط الجديدة",
@@ -877,12 +1077,13 @@ async def points_set(
     )
 
     await interaction.response.send_message(
-        f"✅ تم تحديد نقاط {user.mention} إلى **{amount}**."
+        f"✅ تم تغيير نقاط {user.mention} "
+        f"من **{old}** إلى **{amount}**."
     )
 
 
 # =========================================================
-# HISTORY
+# /points-history
 # =========================================================
 
 @bot.tree.command(
@@ -897,21 +1098,29 @@ async def points_history(
     user: discord.Member = None
 ):
 
-    target = user or interaction.user
+    target = (
+        user
+        if user
+        else interaction.user
+    )
 
-    rows = db.execute("""
+    rows = db.execute(
+        """
         SELECT *
         FROM history
         WHERE guild_id = ?
         AND user_id = ?
         ORDER BY id DESC
         LIMIT 15
-    """, (
-        interaction.guild.id,
-        target.id
-    )).fetchall()
+        """,
+        (
+            interaction.guild.id,
+            target.id
+        )
+    ).fetchall()
 
     if not rows:
+
         return await interaction.response.send_message(
             "📜 لا يوجد سجل.",
             ephemeral=True
@@ -923,10 +1132,16 @@ async def points_history(
 
         if row["action"] == "remove":
             symbol = "🔻"
+
         elif row["action"] == "give":
             symbol = "🔺"
+
         elif row["action"] == "voice":
             symbol = "🎙️"
+
+        elif row["action"] == "buy":
+            symbol = "🛒"
+
         else:
             symbol = "⚙️"
 
@@ -951,16 +1166,14 @@ async def points_history(
 
 
 # =========================================================
-# ADMIN: RESET
+# /points-reset
 # =========================================================
 
 @bot.tree.command(
     name="points-reset",
     description="تصفير نقاط عضو"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     user="العضو",
     reason="سبب التصفير"
@@ -995,22 +1208,21 @@ async def points_reset(
     )
 
     await interaction.response.send_message(
-        f"♻️ تم تصفير نقاط {user.mention}.\n"
-        f"🪙 كان لديه: **{old}** نقطة."
+        f"♻️ تم تصفير نقاط "
+        f"{user.mention}.\n"
+        f"🪙 كان لديه: **{old} نقطة**."
     )
 
 
 # =========================================================
-# SETUP
+# /points-setup
 # =========================================================
 
 @bot.tree.command(
     name="points-setup",
     description="إعداد نظام النقاط"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     notification_channel="روم إشعارات النقاط - اختياري",
     dm="إرسال إشعارات DM؟",
@@ -1023,7 +1235,8 @@ async def points_setup(
     afk_channel: discord.VoiceChannel = None
 ):
 
-    db.execute("""
+    db.execute(
+        """
         INSERT INTO guild_settings (
             guild_id,
             notification_channel_id,
@@ -1033,19 +1246,28 @@ async def points_setup(
         VALUES (?, ?, ?, ?)
         ON CONFLICT(guild_id)
         DO UPDATE SET
-            notification_channel_id = excluded.notification_channel_id,
-            dm_enabled = excluded.dm_enabled,
-            afk_channel_id = excluded.afk_channel_id
-    """, (
-        interaction.guild.id,
-        notification_channel.id
-        if notification_channel
-        else None,
-        int(dm),
-        afk_channel.id
-        if afk_channel
-        else None
-    ))
+            notification_channel_id =
+                excluded.notification_channel_id,
+            dm_enabled =
+                excluded.dm_enabled,
+            afk_channel_id =
+                excluded.afk_channel_id
+        """,
+        (
+            interaction.guild.id,
+            (
+                notification_channel.id
+                if notification_channel
+                else None
+            ),
+            int(dm),
+            (
+                afk_channel.id
+                if afk_channel
+                else None
+            )
+        )
+    )
 
     db.commit()
 
@@ -1061,7 +1283,11 @@ async def points_setup(
         else "❌ غير محدد"
     )
 
-    dm_text = "✅ مفعّل" if dm else "❌ معطل"
+    dm_text = (
+        "✅ مفعّل"
+        if dm
+        else "❌ معطل"
+    )
 
     embed = discord.Embed(
         title="⚙️ إعدادات نظام النقاط",
@@ -1090,7 +1316,8 @@ async def points_setup(
         name="🎙️ النظام",
         value=(
             "10 نقاط لكل ساعة\n"
-            "15 دقيقة بدون نشاط = إيقاف الحساب"
+            "15 دقيقة بدون نشاط = إيقاف الحساب\n"
+            "الميكروفون المغلق لا يمنع احتساب الوقت"
         ),
         inline=False
     )
@@ -1101,16 +1328,14 @@ async def points_setup(
 
 
 # =========================================================
-# MESSAGE SETTINGS
+# /points-message
 # =========================================================
 
 @bot.tree.command(
     name="points-message",
     description="تغيير رسالة إشعار النقاط"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     message="رسالة الإشعار"
 )
@@ -1120,19 +1345,23 @@ async def points_message(
 ):
 
     if len(message) > 2000:
+
         return await interaction.response.send_message(
-            "❌ الرسالة طويلة جدًا. الحد 2000 حرف.",
+            "❌ الرسالة طويلة جدًا.",
             ephemeral=True
         )
 
-    db.execute("""
+    db.execute(
+        """
         UPDATE guild_settings
         SET notification_message = ?
         WHERE guild_id = ?
-    """, (
-        message,
-        interaction.guild.id
-    ))
+        """,
+        (
+            message,
+            interaction.guild.id
+        )
+    )
 
     db.commit()
 
@@ -1142,16 +1371,14 @@ async def points_message(
 
 
 # =========================================================
-# CHANNEL
+# /points-channel
 # =========================================================
 
 @bot.tree.command(
     name="points-channel",
     description="تحديد روم إشعارات النقاط"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@admin_only()
 @app_commands.describe(
     channel="الروم - اتركه فارغًا لإلغاء الإشعارات"
 )
@@ -1160,23 +1387,33 @@ async def points_channel(
     channel: discord.TextChannel = None
 ):
 
-    db.execute("""
+    db.execute(
+        """
         UPDATE guild_settings
         SET notification_channel_id = ?
         WHERE guild_id = ?
-    """, (
-        channel.id if channel else None,
-        interaction.guild.id
-    ))
+        """,
+        (
+            channel.id
+            if channel
+            else None,
+            interaction.guild.id
+        )
+    )
 
     db.commit()
 
     if channel:
-        text = f"✅ تم تحديد {channel.mention} كروم إشعارات."
-    else:
+
         text = (
-            "✅ تم إلغاء روم الإشعارات.\n"
-            "لن يتم إرسال إشعارات في السيرفر."
+            f"✅ تم تحديد {channel.mention} "
+            f"كروم إشعارات."
+        )
+
+    else:
+
+        text = (
+            "✅ تم إلغاء روم الإشعارات."
         )
 
     await interaction.response.send_message(
@@ -1196,20 +1433,25 @@ SHOP_ITEMS = {
 }
 
 
+# =========================================================
+# /shop
+# =========================================================
+
 @bot.tree.command(
     name="shop",
     description="عرض متجر النقاط"
 )
-async def shop(interaction):
+async def shop(
+    interaction: discord.Interaction
+):
 
     text = (
         "🛒 **متجر النقاط**\n\n"
-        "يمكنك استخدام `/buy` للشراء.\n\n"
+        "استخدم `/buy` للشراء.\n\n"
         "🎁 `100` نقطة — مكافأة صغيرة\n"
         "⭐ `500` نقطة — مكافأة متوسطة\n"
         "💎 `1000` نقطة — مكافأة كبيرة\n"
-        "👑 `2500` نقطة — مكافأة أسطورية\n\n"
-        "⚠️ يمكن تعديل المكافآت لاحقًا وربطها برتب."
+        "👑 `2500` نقطة — مكافأة أسطورية"
     )
 
     await interaction.response.send_message(
@@ -1218,7 +1460,7 @@ async def shop(interaction):
 
 
 # =========================================================
-# BUY
+# /buy
 # =========================================================
 
 @bot.tree.command(
@@ -1226,7 +1468,7 @@ async def shop(interaction):
     description="شراء مكافأة بالنقاط"
 )
 @app_commands.describe(
-    item="سعر/معرف العنصر"
+    item="سعر العنصر"
 )
 async def buy(
     interaction,
@@ -1236,8 +1478,8 @@ async def buy(
     if item not in SHOP_ITEMS:
 
         return await interaction.response.send_message(
-            "❌ هذا العنصر غير موجود.\n"
-            "استخدم `/shop` لرؤية العناصر.",
+            "❌ العنصر غير موجود.\n"
+            "استخدم `/shop`.",
             ephemeral=True
         )
 
@@ -1251,7 +1493,7 @@ async def buy(
     if data["points"] < price:
 
         return await interaction.response.send_message(
-            f"❌ ما عندك نقاط كافية.\n"
+            f"❌ نقاطك غير كافية.\n"
             f"رصيدك: **{data['points']}**\n"
             f"السعر: **{price}**",
             ephemeral=True
@@ -1284,7 +1526,7 @@ async def buy(
 
 
 # =========================================================
-# STATS
+# /stats
 # =========================================================
 
 @bot.tree.command(
@@ -1299,22 +1541,29 @@ async def stats(
     user: discord.Member = None
 ):
 
-    target = user or interaction.user
+    target = (
+        user
+        if user
+        else interaction.user
+    )
 
     data = get_user(
         interaction.guild.id,
         target.id
     )
 
-    rank_row = db.execute("""
+    rank = db.execute(
+        """
         SELECT COUNT(*) + 1 AS rank
         FROM users
         WHERE guild_id = ?
         AND points > ?
-    """, (
-        interaction.guild.id,
-        data["points"]
-    )).fetchone()
+        """,
+        (
+            interaction.guild.id,
+            data["points"]
+        )
+    ).fetchone()
 
     embed = discord.Embed(
         title=f"📊 إحصائيات {target.display_name}",
@@ -1333,7 +1582,7 @@ async def stats(
 
     embed.add_field(
         name="🏆 الترتيب",
-        value=f"**#{rank_row['rank']}**",
+        value=f"**#{rank['rank']}**",
         inline=True
     )
 
@@ -1351,7 +1600,7 @@ async def stats(
 
 
 # =========================================================
-# ERRORS
+# ERROR HANDLER
 # =========================================================
 
 @bot.tree.error
@@ -1365,33 +1614,38 @@ async def on_app_command_error(
         app_commands.errors.MissingPermissions
     ):
 
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                "❌ هذا الأمر للإدارة فقط.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ هذا الأمر للإدارة فقط.",
-                ephemeral=True
-            )
-
-        return
-
-    print(
-        f"[Slash Command Error] {error}"
-    )
-
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            "❌ حدث خطأ أثناء تنفيذ الأمر.",
-            ephemeral=True
+        message = (
+            "❌ هذا الأمر للإدارة فقط."
         )
+
     else:
-        await interaction.response.send_message(
-            "❌ حدث خطأ أثناء تنفيذ الأمر.",
-            ephemeral=True
+
+        print(
+            f"[COMMAND ERROR] {error}"
         )
+
+        message = (
+            "❌ حدث خطأ أثناء تنفيذ الأمر."
+        )
+
+    try:
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
+
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -1402,25 +1656,33 @@ async def on_app_command_error(
 async def on_ready():
 
     print("=" * 50)
-    print(f"Logged in as: {bot.user}")
-    print(f"Bot ID: {bot.user.id}")
-    print(f"Guilds: {len(bot.guilds)}")
+    print(
+        f"Logged in as: {bot.user}"
+    )
+    print(
+        f"Bot ID: {bot.user.id}"
+    )
+    print(
+        f"Guilds: {len(bot.guilds)}"
+    )
     print("=" * 50)
 
     try:
+
         synced = await bot.tree.sync()
 
         print(
             f"Synced {len(synced)} slash commands."
         )
 
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"Slash Sync Error: {e}"
+            f"[SYNC ERROR] {error}"
         )
 
     if not points_loop.is_running():
+
         points_loop.start()
 
 
@@ -1429,6 +1691,7 @@ async def on_ready():
 # =========================================================
 
 if not TOKEN:
+
     raise RuntimeError(
         "TOKEN environment variable is missing."
     )
