@@ -17,7 +17,7 @@ POINTS_PER_HOUR = 10
 INACTIVITY_MINUTES = 15
 TICK_SECONDS = 30
 
-DB_FILE = "points.db"
+DB_FILE = "/data/points.db"
 
 
 # =========================================================
